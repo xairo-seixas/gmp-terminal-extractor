@@ -57,7 +57,12 @@ def parse_page(url):
             continue
         slot_date = m.group(1)
         print(f"  Parsing date: {slot_date}")
-
+        
+        if slot_date == list(re.findall(r"\d{2}/\d{2}/\d{4}", soup.get_text()))[0]:
+            siblings = list(header.find_next_siblings())[:15]
+            for i, s in enumerate(siblings):
+                print(f"    [{i}] {repr(s.get_text(' ', strip=True)[:80])}")
+                
         day_en = ""
         prev = header.find_previous(string=re.compile("|".join(days), re.I))
         if prev:
