@@ -20,9 +20,17 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def parse_page(url):
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(3000)
+        html = page.content()
+        browser.close()
+
+    soup = BeautifulSoup(html, "html.parser")
 
     slots = []
     days = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
@@ -83,12 +91,6 @@ def parse_page(url):
                 })
 
     return slots
-
-
-def build_csv(all_slots, output_path):
-    import csv
-    with open(output_path, "w", newline="") as f:
-        w = csv.writer(f)
         w.writerow(["Date", "Day", "Time Slot", "Capacity", "Remaining", "Fill %", "Waitlist %"])
         for s in all_slots:
             cap, rem = s["capacity"], s["remaining"]
