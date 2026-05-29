@@ -28,4 +28,4 @@ jobs:
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: python extract_slots.py
+        run: python -u extract_slots.py
