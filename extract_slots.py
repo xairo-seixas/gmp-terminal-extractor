@@ -86,7 +86,7 @@ def parse_page(url):
             current_day = DAY_MAP[t.lower()]
             i += 1
             continue
-        time_m = re.search(r'(\d{1,2}:\d{2})\s*[-\u2013\u2014]\s*(\d{1,2}:\d{2})', t)
+        time_m = re.search(r'(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})', t)
         if time_m and current_date:
             start, end = time_m.group(1), time_m.group(2)
             for j in range(i + 1, min(i + 20, len(texts))):
@@ -115,9 +115,6 @@ def build_csv(all_slots, output_path):
 def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
     creds_info = json.loads(credentials_json)
     if isinstance(creds_info, str):
-       def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
-    creds_info = json.loads(credentials_json)
-    if isinstance(creds_info, str):
         creds_info = json.loads(creds_info)
     creds = service_account.Credentials.from_service_account_info(
         creds_info, scopes=["https://www.googleapis.com/auth/drive"])
@@ -138,6 +135,10 @@ def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
                                media_body=media, fields="id",
                                supportsAllDrives=True).execute()
         print(f"Uploaded: {file_name}")
+
+if __name__ == "__main__":
+    print("Fetching GMP calendar...")
+    all_slots = []
     for url in URLS:
         try:
             slots = parse_page(url)
@@ -152,7 +153,9 @@ def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
     csv_name = f"GMP_Terminal_Slots_{today}.csv"
     build_csv(all_slots, csv_name)
 
-    folder_id = os.environ.get("GDRIVE_FOLDER_ID", "1x8zXb7p9oiSB1C_38eCIX72oU4fLH91L")
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID", "")
+    if not folder_id:
+        raise ValueError("GDRIVE_FOLDER_ID is empty — check the repository secret")
     credentials_json = os.environ["GDRIVE_CREDENTIALS_JSON"]
     upload_to_drive(csv_name, folder_id, credentials_json, mime_type="text/csv")
     print("Done.")
