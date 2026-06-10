@@ -14,6 +14,40 @@ DAY_MAP = {
     'jeudi': 'Thursday', 'vendredi': 'Friday', 'samedi': 'Saturday', 'dimanche': 'Sunday'
 }
 
+def _try_cap(texts, j):
+    tj = texts[j].strip()
+    # Pattern 1: "85 / 6 / 0%" in one node
+    cap_m = re.search(r'(\d+)\s*/\s*(\d+)\s*/\s*(\d+)%?', tj)
+    if cap_m:
+        return {'capacity': int(cap_m.group(1)), 'remaining': int(cap_m.group(2)),
+                'waitlist_pct': int(cap_m.group(3))}
+    # Pattern 2: "80" + "/\n 49 / \n 0%" (actual format seen in logs)
+    n1 = re.match(r'^(\d+)$', tj)
+    if n1 and j + 1 < len(texts):
+        rest = texts[j + 1].strip()
+        rest_m = re.search(r'/\s*(\d+)\s*/\s*(\d+)%?', rest)
+        if rest_m:
+            return {'capacity': int(n1.group(1)), 'remaining': int(rest_m.group(1)),
+                    'waitlist_pct': int(rest_m.group(2))}
+    # Pattern 3: "85", "/", "6", "/", "0%" as 5 nodes
+    if j + 4 < len(texts):
+        n1 = re.match(r'^(\d+)$', tj)
+        s1 = texts[j+1].strip() in ['/', '|']
+        n2 = re.match(r'^(\d+)$', texts[j+2].strip()) if s1 else None
+        s2 = texts[j+3].strip() in ['/', '|'] if n2 else None
+        n3 = re.match(r'^(\d+)%?$', texts[j+4].strip()) if s2 else None
+        if n1 and s1 and n2 and s2 and n3:
+            return {'capacity': int(n1.group(1)), 'remaining': int(n2.group(1)),
+                    'waitlist_pct': int(n3.group(1).rstrip('%'))}
+    # Pattern 4: "85", "6", "0%" as 3 nodes
+    if j + 2 < len(texts):
+        n2 = re.match(r'^(\d+)$', texts[j+1].strip()) if n1 else None
+        n3 = re.match(r'^(\d+)%?$', texts[j+2].strip()) if n2 else None
+        if n1 and n2 and n3:
+            return {'capacity': int(n1.group(1)), 'remaining': int(n2.group(1)),
+                    'waitlist_pct': int(n3.group(1).rstrip('%'))}
+    return None
+
 def parse_page(url):
     from playwright.sync_api import sync_playwright
     print(f"  Fetching {url}...")
@@ -37,55 +71,22 @@ def parse_page(url):
         browser.close()
 
     print(f"  Text nodes: {len(texts)}")
-
-    # Debug: print first 60 nodes to understand structure
-    print("  FIRST 60 NODES:")
-    for idx, t in enumerate(texts[:60]):
-        print(f"    [{idx}] {repr(t)}")
-
     slots = []
     current_date = None
     current_day = None
-
     i = 0
     while i < len(texts):
         t = texts[i].strip()
-
-        # Detect date
         date_m = re.search(r'(\d{2}/\d{2}/\d{4})', t)
         if date_m:
             current_date = date_m.group(1)
             i += 1
             continue
-
-        # Detect day name
         if t.lower() in DAY_MAP:
             current_day = DAY_MAP[t.lower()]
             i += 1
             continue
-
-        # Detect time slot (single node: "7:00 - 8:00")
         time_m = re.search(r'(\d{1,2}:\d{2})\s*[-\u2013\u2014]\s*(\d{1,2}:\d{2})', t)
-        if not time_m and re.match(r'^\d{1,2}:\d{2}$', t):
-            # Time might be split: "7:00" + "-" + "8:00"
-            if i + 2 < len(texts):
-                sep = texts[i+1].strip()
-                nxt = texts[i+2].strip()
-                if sep in ['-', '\u2013', '\u2014', '\u2012'] and re.match(r'^\d{1,2}:\d{2}$', nxt):
-                    start, end = t, nxt
-                    i += 3
-                    # search for capacity
-                    for j in range(i, min(i + 20, len(texts))):
-                        found = _try_cap(texts, j)
-                        if found:
-                            slots.append({'date': current_date, 'day': current_day or '',
-                                          'slot': f"{start} - {end}", 'start': start, 'end': end,
-                                          **found})
-                            break
-                        if re.match(r'^\d{1,2}:\d{2}', texts[j].strip()):
-                            break
-                    continue
-
         if time_m and current_date:
             start, end = time_m.group(1), time_m.group(2)
             for j in range(i + 1, min(i + 20, len(texts))):
@@ -95,43 +96,11 @@ def parse_page(url):
                                   'slot': f"{start} - {end}", 'start': start, 'end': end,
                                   **found})
                     break
-                if j > i+1 and re.match(r'^\d{1,2}:\d{2}', texts[j].strip()):
+                if j > i + 1 and re.match(r'^\d{1,2}:\d{2}', texts[j].strip()):
                     break
-
         i += 1
-
     print(f"  Slots found: {len(slots)}")
     return slots
-
-
-def _try_cap(texts, j):
-    """Try to extract capacity/remaining/waitlist starting at index j."""
-    tj = texts[j].strip()
-    # Pattern 1: "85 / 6 / 0%" all in one node
-    cap_m = re.search(r'(\d+)\s*/\s*(\d+)\s*/\s*(\d+)%?', tj)
-    if cap_m:
-        return {'capacity': int(cap_m.group(1)), 'remaining': int(cap_m.group(2)),
-                'waitlist_pct': int(cap_m.group(3))}
-    # Pattern 2: "85", "/", "6", "/", "0%" as 5 nodes
-    if j + 4 < len(texts):
-        n1 = re.match(r'^(\d+)$', tj)
-        s1 = texts[j+1].strip() in ['/', '|']
-        n2 = re.match(r'^(\d+)$', texts[j+2].strip())
-        s2 = texts[j+3].strip() in ['/', '|']
-        n3 = re.match(r'^(\d+)%?$', texts[j+4].strip())
-        if n1 and s1 and n2 and s2 and n3:
-            return {'capacity': int(n1.group(1)), 'remaining': int(n2.group(1)),
-                    'waitlist_pct': int(n3.group(1).rstrip('%'))}
-    # Pattern 3: "85", "6", "0%" as 3 nodes (no separators)
-    if j + 2 < len(texts):
-        n1 = re.match(r'^(\d+)$', tj)
-        n2 = re.match(r'^(\d+)$', texts[j+1].strip())
-        n3 = re.match(r'^(\d+)%?$', texts[j+2].strip())
-        if n1 and n2 and n3:
-            return {'capacity': int(n1.group(1)), 'remaining': int(n2.group(1)),
-                    'waitlist_pct': int(n3.group(1).rstrip('%'))}
-    return None
-
 
 def build_csv(all_slots, output_path):
     with open(output_path, "w", newline="") as f:
@@ -143,9 +112,10 @@ def build_csv(all_slots, output_path):
                         f"{(cap-rem)/cap*100:.0f}%", f"{s['waitlist_pct']}%"])
     print(f"Saved: {output_path}")
 
-
 def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
     creds_info = json.loads(credentials_json)
+    if isinstance(creds_info, str):
+        creds_info = json.loads(creds_info)
     creds = service_account.Credentials.from_service_account_info(
         creds_info, scopes=["https://www.googleapis.com/auth/drive.file"])
     service = build("drive", "v3", credentials=creds)
@@ -161,7 +131,6 @@ def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
         service.files().create(body={"name": file_name, "parents": [folder_id]},
                                media_body=media, fields="id").execute()
         print(f"Uploaded: {file_name}")
-
 
 if __name__ == "__main__":
     print("Fetching GMP calendar...")
