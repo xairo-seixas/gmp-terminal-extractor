@@ -115,26 +115,29 @@ def build_csv(all_slots, output_path):
 def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
     creds_info = json.loads(credentials_json)
     if isinstance(creds_info, str):
+       def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
+    creds_info = json.loads(credentials_json)
+    if isinstance(creds_info, str):
         creds_info = json.loads(creds_info)
     creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+        creds_info, scopes=["https://www.googleapis.com/auth/drive"])
     service = build("drive", "v3", credentials=creds)
     file_name = os.path.basename(file_path)
     existing = service.files().list(
         q=f"name='{file_name}' and '{folder_id}' in parents and trashed=false",
-        fields="files(id)").execute().get("files", [])
+        fields="files(id)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True).execute().get("files", [])
     media = MediaFileUpload(file_path, mimetype=mime_type)
     if existing:
-        service.files().update(fileId=existing[0]["id"], media_body=media).execute()
+        service.files().update(fileId=existing[0]["id"], media_body=media,
+                               supportsAllDrives=True).execute()
         print(f"Updated: {file_name}")
     else:
         service.files().create(body={"name": file_name, "parents": [folder_id]},
-                               media_body=media, fields="id").execute()
+                               media_body=media, fields="id",
+                               supportsAllDrives=True).execute()
         print(f"Uploaded: {file_name}")
-
-if __name__ == "__main__":
-    print("Fetching GMP calendar...")
-    all_slots = []
     for url in URLS:
         try:
             slots = parse_page(url)
