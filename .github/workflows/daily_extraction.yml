@@ -28,4 +28,28 @@ jobs:
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
-        run: python -u extract_slots.py
+        run: |
+          python - <<'EOF'
+          import os, json
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          fid = os.environ.get("GDRIVE_FOLDER_ID", "")
+          print("id length:", len(fid), "| starts:", fid[:4], "| ends:", fid[-4:])
+          info = json.loads(os.environ["GDRIVE_CREDENTIALS_JSON"])
+          if isinstance(info, str): info = json.loads(info)
+          print("service account:", info.get("client_email"))
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=["https://www.googleapis.com/auth/drive"])
+          svc = build("drive", "v3", credentials=creds)
+          try:
+              f = svc.files().get(fileId=fid, supportsAllDrives=True,
+                                  fields="id,name,mimeType,driveId").execute()
+              print("FOLDER OK:", f)
+          except Exception as e:
+              print("FOLDER GET FAILED:", e)
+          r = svc.files().list(pageSize=10, fields="files(id,name,mimeType)",
+                               supportsAllDrives=True, includeItemsFromAllDrives=True,
+                               corpora="allDrives").execute()
+          print("First files visible to this account:", r.get("files"))
+          EOF
+          python -u extract_slots.py
