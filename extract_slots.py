@@ -1,161 +1,177 @@
-import os, re, json, csv
-from datetime import date
+#!/usr/bin/env python3
+"""Extract GMP Terminal de France appointment slots and upload a CSV to Google Drive.
+
+Fixes vs previous version:
+- Day column derived from each row's date (was: today's weekday everywhere)
+- Junk rows eliminated: a row is only emitted when an hour label is directly
+  followed by a real "Capacité / Restants / Attente" data triple
+- No timezone-dependent hour math: hours are taken verbatim from the page
+- Fails loudly (exit 1) when parsing yields no data or upload verification fails
+- Re-uses the existing Drive file for the same filename (update, not duplicate)
+- Prints the Drive file ID so the Actions log proves delivery
+"""
+
+import csv
+import io
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaIoBaseUpload
 
 URLS = [
     "https://www.rdvgmp.fr/static/calendar_tdf.html",
     "https://www.rdvgmp.fr/static/calendar_tdf_next_week.html",
 ]
 
-DAY_MAP = {
-    'lundi': 'Monday', 'mardi': 'Tuesday', 'mercredi': 'Wednesday',
-    'jeudi': 'Thursday', 'vendredi': 'Friday', 'samedi': 'Saturday', 'dimanche': 'Sunday'
-}
+DAY_HEADER = re.compile(r"Détails des disponibilités\s*du\s*(\d{2}/\d{2}/\d{4})")
+HOUR_LABEL = re.compile(r"\b(\d{1,2}):00\s*-\s*(\d{1,2}):00\b")
+CAPACITY = re.compile(
+    r"Capacité\s*/\s*Restants\s*/\s*Attente\s*(\d+)\s*/\s*(\d+)\s*/\s*(\d+)\s*%"
+)
 
-def _try_cap(texts, j):
-    tj = texts[j].strip()
-    # Pattern 1: "85 / 6 / 0%" in one node
-    cap_m = re.search(r'(\d+)\s*/\s*(\d+)\s*/\s*(\d+)%?', tj)
-    if cap_m:
-        return {'capacity': int(cap_m.group(1)), 'remaining': int(cap_m.group(2)),
-                'waitlist_pct': int(cap_m.group(3))}
-    # Pattern 2: "80" + "/\n 49 / \n 0%" (actual format seen in logs)
-    n1 = re.match(r'^(\d+)$', tj)
-    if n1 and j + 1 < len(texts):
-        rest = texts[j + 1].strip()
-        rest_m = re.search(r'/\s*(\d+)\s*/\s*(\d+)%?', rest)
-        if rest_m:
-            return {'capacity': int(n1.group(1)), 'remaining': int(rest_m.group(1)),
-                    'waitlist_pct': int(rest_m.group(2))}
-    # Pattern 3: "85", "/", "6", "/", "0%" as 5 nodes
-    if j + 4 < len(texts):
-        n1 = re.match(r'^(\d+)$', tj)
-        s1 = texts[j+1].strip() in ['/', '|']
-        n2 = re.match(r'^(\d+)$', texts[j+2].strip()) if s1 else None
-        s2 = texts[j+3].strip() in ['/', '|'] if n2 else None
-        n3 = re.match(r'^(\d+)%?$', texts[j+4].strip()) if s2 else None
-        if n1 and s1 and n2 and s2 and n3:
-            return {'capacity': int(n1.group(1)), 'remaining': int(n2.group(1)),
-                    'waitlist_pct': int(n3.group(1).rstrip('%'))}
-    # Pattern 4: "85", "6", "0%" as 3 nodes
-    if j + 2 < len(texts):
-        n2 = re.match(r'^(\d+)$', texts[j+1].strip()) if n1 else None
-        n3 = re.match(r'^(\d+)%?$', texts[j+2].strip()) if n2 else None
-        if n1 and n2 and n3:
-            return {'capacity': int(n1.group(1)), 'remaining': int(n2.group(1)),
-                    'waitlist_pct': int(n3.group(1).rstrip('%'))}
-    return None
 
-def parse_page(url):
-    from playwright.sync_api import sync_playwright
-    print(f"  Fetching {url}...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(4000)
-        texts = page.evaluate("""
-        () => {
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-            const texts = [];
-            let node;
-            while (node = walker.nextNode()) {
-                const t = node.textContent.trim();
-                if (t) texts.push(t);
-            }
-            return texts;
-        }
-        """)
-        browser.close()
+def fetch_text(url: str) -> str:
+    """Fetch a page and reduce its HTML to whitespace-normalized text."""
+    resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    html = resp.text
+    html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", text)
 
-    print(f"  Text nodes: {len(texts)}")
-    slots = []
-    current_date = None
-    current_day = None
-    i = 0
-    while i < len(texts):
-        t = texts[i].strip()
-        date_m = re.search(r'(\d{2}/\d{2}/\d{4})', t)
-        if date_m:
-            current_date = date_m.group(1)
-            i += 1
-            continue
-        if t.lower() in DAY_MAP:
-            current_day = DAY_MAP[t.lower()]
-            i += 1
-            continue
-        time_m = re.search(r'(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})', t)
-        if time_m and current_date:
-            start, end = time_m.group(1), time_m.group(2)
-            for j in range(i + 1, min(i + 20, len(texts))):
-                found = _try_cap(texts, j)
-                if found:
-                    slots.append({'date': current_date, 'day': current_day or '',
-                                  'slot': f"{start} - {end}", 'start': start, 'end': end,
-                                  **found})
-                    break
-                if j > i + 1 and re.match(r'^\d{1,2}:\d{2}', texts[j].strip()):
-                    break
-        i += 1
-    print(f"  Slots found: {len(slots)}")
-    return slots
 
-def build_csv(all_slots, output_path):
-    with open(output_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["Date", "Day", "Time Slot", "Capacity", "Remaining", "Fill %", "Waitlist %"])
-        for s in all_slots:
-            cap, rem = s["capacity"], s["remaining"]
-            w.writerow([s["date"], s["day"], s["slot"], cap, rem,
-                        f"{(cap-rem)/cap*100:.0f}%", f"{s['waitlist_pct']}%"])
-    print(f"Saved: {output_path}")
+def parse_day_section(section: str):
+    """Yield (start_hour, capacity, remaining, waitlist_pct) for hours with data.
 
-def upload_to_drive(file_path, folder_id, credentials_json, mime_type):
-    creds_info = json.loads(credentials_json)
-    if isinstance(creds_info, str):
-        creds_info = json.loads(creds_info)
+    Walks hour labels and capacity triples in document order; a capacity triple
+    belongs to the closest preceding hour label. Hours without a triple
+    (closed slots) produce no row, and stray numbers elsewhere on the page
+    can never produce a row because they lack the Capacité prefix.
+    """
+    events = []
+    for m in HOUR_LABEL.finditer(section):
+        events.append((m.start(), "hour", (int(m.group(1)), int(m.group(2)))))
+    for m in CAPACITY.finditer(section):
+        events.append(
+            (m.start(), "cap", (int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        )
+    events.sort(key=lambda e: e[0])
+
+    current_hour = None
+    for _, kind, val in events:
+        if kind == "hour":
+            current_hour = val
+        else:  # capacity triple
+            if current_hour is not None:
+                start, end = current_hour
+                if end == start + 1 and 0 <= start <= 23:
+                    yield (start, *val)
+            current_hour = None
+
+
+def extract_rows():
+    rows = []
+    for url in URLS:
+        print(f"Fetching {url}")
+        text = fetch_text(url)
+        parts = DAY_HEADER.split(text)
+        # parts = [preamble, date1, body1, date2, body2, ...]
+        for i in range(1, len(parts) - 1, 2):
+            date_str = parts[i]
+            body = parts[i + 1]
+            day_name = datetime.strptime(date_str, "%d/%m/%Y").strftime("%A")
+            for start, cap, rem, wait in parse_day_section(body):
+                fill = round(100 * (cap - rem) / cap) if cap else 0
+                rows.append(
+                    [
+                        date_str,
+                        day_name,
+                        f"{start}:00 - {start + 1}:00",
+                        cap,
+                        rem,
+                        f"{fill}%",
+                        f"{wait}%",
+                    ]
+                )
+            print(f"  {date_str} ({day_name}): "
+                  f"{sum(1 for r in rows if r[0] == date_str)} slots with data")
+    return rows
+
+
+def upload_to_drive(filename: str, data: bytes) -> str:
+    folder_id = os.environ["GDRIVE_FOLDER_ID"]
+    info = json.loads(os.environ["GDRIVE_CREDENTIALS_JSON"])
+    if isinstance(info, str):
+        info = json.loads(info)
     creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=["https://www.googleapis.com/auth/drive"])
-    service = build("drive", "v3", credentials=creds)
-    file_name = os.path.basename(file_path)
-    existing = service.files().list(
-        q=f"name='{file_name}' and '{folder_id}' in parents and trashed=false",
-        fields="files(id)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True).execute().get("files", [])
-    media = MediaFileUpload(file_path, mimetype=mime_type)
+        info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    svc = build("drive", "v3", credentials=creds)
+
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="text/csv", resumable=False)
+    existing = (
+        svc.files()
+        .list(
+            q=f"name = '{filename}' and '{folder_id}' in parents and trashed = false",
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+        .get("files", [])
+    )
     if existing:
-        service.files().update(fileId=existing[0]["id"], media_body=media,
-                               supportsAllDrives=True).execute()
-        print(f"Updated: {file_name}")
+        file_id = existing[0]["id"]
+        svc.files().update(
+            fileId=file_id, media_body=media, supportsAllDrives=True
+        ).execute()
+        action = "updated"
     else:
-        service.files().create(body={"name": file_name, "parents": [folder_id]},
-                               media_body=media, fields="id",
-                               supportsAllDrives=True).execute()
-        print(f"Uploaded: {file_name}")
+        meta = {"name": filename, "parents": [folder_id]}
+        file_id = (
+            svc.files()
+            .create(body=meta, media_body=media, fields="id", supportsAllDrives=True)
+            .execute()["id"]
+        )
+        action = "created"
+
+    # Round-trip verification: download what Drive stored and compare bytes.
+    stored = svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+    if stored != data:
+        print("FATAL: verification failed — bytes in Drive differ from local bytes.")
+        sys.exit(1)
+
+    print(f"OK: {action} {filename} — file id {file_id}, "
+          f"{len(data)} bytes, verified byte-identical in Drive.")
+    return file_id
+
+
+def main():
+    rows = extract_rows()
+    if len(rows) < 10:
+        print(f"FATAL: only {len(rows)} slot rows parsed — "
+              f"page layout changed or no data rendered. Failing the run.")
+        sys.exit(1)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Day", "Time Slot", "Capacity", "Remaining",
+                     "Fill %", "Waitlist %"])
+    writer.writerows(rows)
+    data = buf.getvalue().encode("utf-8")
+
+    today_paris = datetime.now(ZoneInfo("Europe/Paris")).date()
+    filename = f"GMP_Terminal_Slots_{today_paris.isoformat()}.csv"
+    upload_to_drive(filename, data)
+    print(f"Done. {len(rows)} rows written.")
+
 
 if __name__ == "__main__":
-    print("Fetching GMP calendar...")
-    all_slots = []
-    for url in URLS:
-        try:
-            slots = parse_page(url)
-            all_slots.extend(slots)
-        except Exception as e:
-            print(f"  WARNING: {url} failed: {e}")
-
-    if not all_slots:
-        raise RuntimeError("No slots extracted — aborting.")
-
-    today = date.today().strftime("%Y-%m-%d")
-    csv_name = f"GMP_Terminal_Slots_{today}.csv"
-    build_csv(all_slots, csv_name)
-
-    folder_id = os.environ.get("GDRIVE_FOLDER_ID", "")
-    if not folder_id:
-        raise ValueError("GDRIVE_FOLDER_ID is empty — check the repository secret")
-    credentials_json = os.environ["GDRIVE_CREDENTIALS_JSON"]
-    upload_to_drive(csv_name, folder_id, credentials_json, mime_type="text/csv")
-    print("Done.")
+    main()
