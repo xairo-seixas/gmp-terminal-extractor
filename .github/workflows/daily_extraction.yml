@@ -52,4 +52,4 @@ jobs:
                                corpora="allDrives").execute()
           print("First files visible to this account:", r.get("files"))
           EOF
-          python -u extract_slots.py
+          python -u terminal_slot_scraper.py
