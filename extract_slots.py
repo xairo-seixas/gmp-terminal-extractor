@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Extract GMP Terminal de France appointment slots and upload a CSV to Google Drive.
-
 Fixes vs previous version:
 - Day column derived from each row's date (was: today's weekday everywhere)
 - Junk rows eliminated: a row is only emitted when an hour label is directly
@@ -9,8 +8,8 @@ Fixes vs previous version:
 - Fails loudly (exit 1) when parsing yields no data or upload verification fails
 - Re-uses the existing Drive file for the same filename (update, not duplicate)
 - Prints the Drive file ID so the Actions log proves delivery
+- Uses Playwright to render JavaScript before parsing (fixes 0-row issue)
 """
-
 import csv
 import io
 import json
@@ -20,10 +19,10 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from playwright.sync_api import sync_playwright
 
 URLS = [
     "https://www.rdvgmp.fr/static/calendar_tdf.html",
@@ -38,10 +37,13 @@ CAPACITY = re.compile(
 
 
 def fetch_text(url: str) -> str:
-    """Fetch a page and reduce its HTML to whitespace-normalized text."""
-    resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    html = resp.text
+    """Fetch a JS-rendered page and reduce its HTML to whitespace-normalized text."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=60_000)
+        html = page.content()
+        browser.close()
     html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", html)
     return re.sub(r"\s+", " ", text)
@@ -114,8 +116,8 @@ def upload_to_drive(filename: str, data: bytes) -> str:
         info, scopes=["https://www.googleapis.com/auth/drive"]
     )
     svc = build("drive", "v3", credentials=creds)
-
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype="text/csv", resumable=False)
+
     existing = (
         svc.files()
         .list(
@@ -127,6 +129,7 @@ def upload_to_drive(filename: str, data: bytes) -> str:
         .execute()
         .get("files", [])
     )
+
     if existing:
         file_id = existing[0]["id"]
         svc.files().update(
