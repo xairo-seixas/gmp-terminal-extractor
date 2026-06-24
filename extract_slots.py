@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
-"""Extract GMP Terminal de France appointment slots and upload a CSV + screenshots
-to Google Drive.
-Fixes vs previous version:
-- Day column derived from each row's date (was: today's weekday everywhere)
-- Junk rows eliminated: a row is only emitted when an hour label is directly
-  followed by a real "Capacité / Restants / Attente" data triple
-- No timezone-dependent hour math: hours are taken verbatim from the page
-- Fails loudly (exit 1) when parsing yields no data or upload verification fails
-- Re-uses the existing Drive file for the same filename (update, not duplicate)
-- Prints the Drive file ID so the Actions log proves delivery
-- Uses Playwright to render JavaScript before parsing (fixes 0-row issue)
-- Takes full-page screenshots of each source URL and uploads them to Drive
+"""Extract GMP terminal appointment slots and upload CSVs + screenshots to Google Drive.
+
+Supports multiple terminals. Each terminal is processed independently — a failure
+in one does not abort the others. The run exits 1 only if at least one terminal
+failed, so the Actions log makes clear which ones succeeded and which did not.
 """
 import csv
 import io
@@ -26,9 +19,28 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from playwright.sync_api import sync_playwright
 
-URLS = [
-    "https://www.rdvgmp.fr/static/calendar_tdf.html",
-    "https://www.rdvgmp.fr/static/calendar_tdf_next_week.html",
+# ---------------------------------------------------------------------------
+# Terminal configuration — add new terminals here, nothing else needs changing
+# ---------------------------------------------------------------------------
+TERMINALS = [
+    {
+        "slug": "tdf",
+        "label": "Terminal de France (Le Havre)",
+        "urls": [
+            "https://www.rdvgmp.fr/static/calendar_tdf.html",
+            "https://www.rdvgmp.fr/static/calendar_tdf_next_week.html",
+        ],
+        "min_rows": 10,
+    },
+    # Example — uncomment and fill in to add another terminal:
+    # {
+    #     "slug": "other",
+    #     "label": "Other Terminal",
+    #     "urls": [
+    #         "https://www.rdvgmp.fr/static/calendar_other.html",
+    #     ],
+    #     "min_rows": 5,
+    # },
 ]
 
 DAY_HEADER = re.compile(r"Détails des disponibilités\s*du\s*(\d{2}/\d{2}/\d{4})")
@@ -38,29 +50,26 @@ CAPACITY = re.compile(
 )
 
 
-def fetch_text_and_screenshot(url: str) -> tuple[str, bytes]:
-    """Render a JS page, return (normalized_text, full_page_png_bytes)."""
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
+# ---------------------------------------------------------------------------
+# Fetching & parsing
+# ---------------------------------------------------------------------------
+
+def fetch_text_and_screenshot(url: str, browser) -> tuple[str, bytes]:
+    """Render a JS page with an existing browser instance; return (text, png_bytes)."""
+    page = browser.new_page()
+    try:
         page.goto(url, wait_until="networkidle", timeout=60_000)
         html = page.content()
         png_bytes = page.screenshot(full_page=True)
-        browser.close()
+    finally:
+        page.close()
     html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text)
-    return text, png_bytes
+    return re.sub(r"\s+", " ", text), png_bytes
 
 
 def parse_day_section(section: str):
-    """Yield (start_hour, capacity, remaining, waitlist_pct) for hours with data.
-
-    Walks hour labels and capacity triples in document order; a capacity triple
-    belongs to the closest preceding hour label. Hours without a triple
-    (closed slots) produce no row, and stray numbers elsewhere on the page
-    can never produce a row because they lack the Capacité prefix.
-    """
+    """Yield (start_hour, capacity, remaining, waitlist_pct) for hours with data."""
     events = []
     for m in HOUR_LABEL.finditer(section):
         events.append((m.start(), "hour", (int(m.group(1)), int(m.group(2)))))
@@ -74,7 +83,7 @@ def parse_day_section(section: str):
     for _, kind, val in events:
         if kind == "hour":
             current_hour = val
-        else:  # capacity triple
+        else:
             if current_hour is not None:
                 start, end = current_hour
                 if end == start + 1 and 0 <= start <= 23:
@@ -82,49 +91,77 @@ def parse_day_section(section: str):
             current_hour = None
 
 
-def extract_rows_and_screenshots() -> tuple[list, list[tuple[str, bytes]]]:
-    """Return (csv_rows, [(screenshot_filename, png_bytes), ...])."""
+# ---------------------------------------------------------------------------
+# Per-terminal processing — raises on any failure so main() can catch it
+# ---------------------------------------------------------------------------
+
+def process_terminal(terminal: dict, browser, svc: object, folder_id: str,
+                     today_str: str) -> int:
+    """Fetch, parse, and upload one terminal. Returns number of rows uploaded.
+
+    Raises RuntimeError with a descriptive message on any failure so the caller
+    can log it and move on to the next terminal.
+    """
+    slug = terminal["slug"]
+    label = terminal["label"]
+    min_rows = terminal["min_rows"]
+    print(f"\n── {label} ({slug}) ──")
+
     rows = []
     screenshots = []
-    today_paris = datetime.now(ZoneInfo("Europe/Paris")).date()
 
-    for url in URLS:
-        print(f"Fetching {url}")
-        text, png_bytes = fetch_text_and_screenshot(url)
+    for url in terminal["urls"]:
+        print(f"  Fetching {url}")
+        text, png_bytes = fetch_text_and_screenshot(url, browser)
 
-        # Derive a filename suffix from the URL slug
-        slug = "next_week" if "next_week" in url else "current_week"
-        screenshot_name = f"GMP_Terminal_Screenshot_{today_paris.isoformat()}_{slug}.png"
+        url_slug = "next_week" if "next_week" in url else "current_week"
+        screenshot_name = f"GMP_Terminal_Screenshot_{today_str}_{slug}_{url_slug}.png"
         screenshots.append((screenshot_name, png_bytes))
         print(f"  Screenshot captured: {screenshot_name} ({len(png_bytes):,} bytes)")
 
         parts = DAY_HEADER.split(text)
-        # parts = [preamble, date1, body1, date2, body2, ...]
         for i in range(1, len(parts) - 1, 2):
             date_str = parts[i]
             body = parts[i + 1]
             day_name = datetime.strptime(date_str, "%d/%m/%Y").strftime("%A")
             for start, cap, rem, wait in parse_day_section(body):
                 fill = round(100 * (cap - rem) / cap) if cap else 0
-                rows.append(
-                    [
-                        date_str,
-                        day_name,
-                        f"{start}:00 - {start + 1}:00",
-                        cap,
-                        rem,
-                        f"{fill}%",
-                        f"{wait}%",
-                    ]
-                )
-            print(f"  {date_str} ({day_name}): "
-                  f"{sum(1 for r in rows if r[0] == date_str)} slots with data")
+                rows.append([date_str, day_name, f"{start}:00 - {start + 1}:00",
+                              cap, rem, f"{fill}%", f"{wait}%"])
+            slot_count = sum(1 for r in rows if r[0] == date_str)
+            print(f"  {date_str} ({day_name}): {slot_count} slots with data")
 
-    return rows, screenshots
+    if len(rows) < min_rows:
+        raise RuntimeError(
+            f"Only {len(rows)} rows parsed (minimum {min_rows}) — "
+            f"page layout may have changed."
+        )
+
+    # Build and upload CSV
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Day", "Time Slot", "Capacity", "Remaining",
+                     "Fill %", "Waitlist %"])
+    writer.writerows(rows)
+    csv_data = buf.getvalue().encode("utf-8")
+    csv_filename = f"GMP_Terminal_Slots_{today_str}_{slug}.csv"
+    upload_file(csv_filename, csv_data, "text/csv", svc, folder_id, verify=True)
+
+    # Upload screenshots
+    for name, png_bytes in screenshots:
+        upload_file(name, png_bytes, "image/png", svc, folder_id, verify=False)
+
+    print(f"  ✓ {slug}: {len(rows)} rows + {len(screenshots)} screenshot(s) uploaded.")
+    return len(rows)
 
 
-def upload_to_drive(filename: str, data: bytes, mimetype: str, svc, folder_id: str) -> str:
-    """Upload or update a file in Drive; return its file ID."""
+# ---------------------------------------------------------------------------
+# Drive upload helper
+# ---------------------------------------------------------------------------
+
+def upload_file(filename: str, data: bytes, mimetype: str, svc, folder_id: str,
+                verify: bool) -> str:
+    """Upload or update a file in Drive; optionally verify byte-identical round-trip."""
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=False)
 
     existing = (
@@ -154,37 +191,22 @@ def upload_to_drive(filename: str, data: bytes, mimetype: str, svc, folder_id: s
         )
         action = "created"
 
-    # Round-trip verification for CSV only (PNG bytes may differ due to Drive re-encoding)
-    if mimetype == "text/csv":
+    if verify:
         stored = svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
         if stored != data:
-            print(f"FATAL: verification failed for {filename} — bytes differ in Drive.")
-            sys.exit(1)
+            raise RuntimeError(f"Verification failed for {filename} — bytes differ in Drive.")
 
-    print(f"OK: {action} {filename} — file id {file_id}, {len(data):,} bytes.")
+    print(f"  {action} {filename} — {file_id} ({len(data):,} bytes)")
     return file_id
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    rows, screenshots = extract_rows_and_screenshots()
+    today_str = datetime.now(ZoneInfo("Europe/Paris")).date().isoformat()
 
-    if len(rows) < 10:
-        print(f"FATAL: only {len(rows)} slot rows parsed — "
-              f"page layout changed or no data rendered. Failing the run.")
-        sys.exit(1)
-
-    # Build CSV
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["Date", "Day", "Time Slot", "Capacity", "Remaining",
-                     "Fill %", "Waitlist %"])
-    writer.writerows(rows)
-    csv_data = buf.getvalue().encode("utf-8")
-
-    today_paris = datetime.now(ZoneInfo("Europe/Paris")).date()
-    csv_filename = f"GMP_Terminal_Slots_{today_paris.isoformat()}.csv"
-
-    # Build Drive service once, reuse for all uploads
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     info = json.loads(os.environ["GDRIVE_CREDENTIALS_JSON"])
     if isinstance(info, str):
@@ -194,14 +216,34 @@ def main():
     )
     svc = build("drive", "v3", credentials=creds)
 
-    # Upload CSV
-    upload_to_drive(csv_filename, csv_data, "text/csv", svc, folder_id)
+    failures = []
 
-    # Upload screenshots
-    for name, png_bytes in screenshots:
-        upload_to_drive(name, png_bytes, "image/png", svc, folder_id)
+    # Single browser instance shared across all terminals
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            for terminal in TERMINALS:
+                try:
+                    process_terminal(terminal, browser, svc, folder_id, today_str)
+                except Exception as exc:
+                    msg = f"{terminal['slug']}: {exc}"
+                    print(f"\n  ✗ FAILED — {msg}")
+                    failures.append(msg)
+        finally:
+            browser.close()
 
-    print(f"Done. {len(rows)} rows + {len(screenshots)} screenshot(s) uploaded.")
+    print(f"\n── Summary ──")
+    print(f"  Terminals processed : {len(TERMINALS)}")
+    print(f"  Succeeded           : {len(TERMINALS) - len(failures)}")
+    print(f"  Failed              : {len(failures)}")
+
+    if failures:
+        print("\nFailures:")
+        for f in failures:
+            print(f"  • {f}")
+        sys.exit(1)
+
+    print("Done.")
 
 
 if __name__ == "__main__":
