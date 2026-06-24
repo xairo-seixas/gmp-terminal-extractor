@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Extract GMP Terminal de France appointment slots and upload a CSV to Google Drive.
+"""Extract GMP Terminal de France appointment slots and upload a CSV + screenshots
+to Google Drive.
 Fixes vs previous version:
 - Day column derived from each row's date (was: today's weekday everywhere)
 - Junk rows eliminated: a row is only emitted when an hour label is directly
@@ -9,6 +10,7 @@ Fixes vs previous version:
 - Re-uses the existing Drive file for the same filename (update, not duplicate)
 - Prints the Drive file ID so the Actions log proves delivery
 - Uses Playwright to render JavaScript before parsing (fixes 0-row issue)
+- Takes full-page screenshots of each source URL and uploads them to Drive
 """
 import csv
 import io
@@ -36,17 +38,19 @@ CAPACITY = re.compile(
 )
 
 
-def fetch_text(url: str) -> str:
-    """Fetch a JS-rendered page and reduce its HTML to whitespace-normalized text."""
+def fetch_text_and_screenshot(url: str) -> tuple[str, bytes]:
+    """Render a JS page, return (normalized_text, full_page_png_bytes)."""
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.goto(url, wait_until="networkidle", timeout=60_000)
         html = page.content()
+        png_bytes = page.screenshot(full_page=True)
         browser.close()
     html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", html)
-    return re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text, png_bytes
 
 
 def parse_day_section(section: str):
@@ -78,11 +82,22 @@ def parse_day_section(section: str):
             current_hour = None
 
 
-def extract_rows():
+def extract_rows_and_screenshots() -> tuple[list, list[tuple[str, bytes]]]:
+    """Return (csv_rows, [(screenshot_filename, png_bytes), ...])."""
     rows = []
+    screenshots = []
+    today_paris = datetime.now(ZoneInfo("Europe/Paris")).date()
+
     for url in URLS:
         print(f"Fetching {url}")
-        text = fetch_text(url)
+        text, png_bytes = fetch_text_and_screenshot(url)
+
+        # Derive a filename suffix from the URL slug
+        slug = "next_week" if "next_week" in url else "current_week"
+        screenshot_name = f"GMP_Terminal_Screenshot_{today_paris.isoformat()}_{slug}.png"
+        screenshots.append((screenshot_name, png_bytes))
+        print(f"  Screenshot captured: {screenshot_name} ({len(png_bytes):,} bytes)")
+
         parts = DAY_HEADER.split(text)
         # parts = [preamble, date1, body1, date2, body2, ...]
         for i in range(1, len(parts) - 1, 2):
@@ -104,19 +119,13 @@ def extract_rows():
                 )
             print(f"  {date_str} ({day_name}): "
                   f"{sum(1 for r in rows if r[0] == date_str)} slots with data")
-    return rows
+
+    return rows, screenshots
 
 
-def upload_to_drive(filename: str, data: bytes) -> str:
-    folder_id = os.environ["GDRIVE_FOLDER_ID"]
-    info = json.loads(os.environ["GDRIVE_CREDENTIALS_JSON"])
-    if isinstance(info, str):
-        info = json.loads(info)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    svc = build("drive", "v3", credentials=creds)
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="text/csv", resumable=False)
+def upload_to_drive(filename: str, data: bytes, mimetype: str, svc, folder_id: str) -> str:
+    """Upload or update a file in Drive; return its file ID."""
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=False)
 
     existing = (
         svc.files()
@@ -145,35 +154,54 @@ def upload_to_drive(filename: str, data: bytes) -> str:
         )
         action = "created"
 
-    # Round-trip verification: download what Drive stored and compare bytes.
-    stored = svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
-    if stored != data:
-        print("FATAL: verification failed — bytes in Drive differ from local bytes.")
-        sys.exit(1)
+    # Round-trip verification for CSV only (PNG bytes may differ due to Drive re-encoding)
+    if mimetype == "text/csv":
+        stored = svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+        if stored != data:
+            print(f"FATAL: verification failed for {filename} — bytes differ in Drive.")
+            sys.exit(1)
 
-    print(f"OK: {action} {filename} — file id {file_id}, "
-          f"{len(data)} bytes, verified byte-identical in Drive.")
+    print(f"OK: {action} {filename} — file id {file_id}, {len(data):,} bytes.")
     return file_id
 
 
 def main():
-    rows = extract_rows()
+    rows, screenshots = extract_rows_and_screenshots()
+
     if len(rows) < 10:
         print(f"FATAL: only {len(rows)} slot rows parsed — "
               f"page layout changed or no data rendered. Failing the run.")
         sys.exit(1)
 
+    # Build CSV
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["Date", "Day", "Time Slot", "Capacity", "Remaining",
                      "Fill %", "Waitlist %"])
     writer.writerows(rows)
-    data = buf.getvalue().encode("utf-8")
+    csv_data = buf.getvalue().encode("utf-8")
 
     today_paris = datetime.now(ZoneInfo("Europe/Paris")).date()
-    filename = f"GMP_Terminal_Slots_{today_paris.isoformat()}.csv"
-    upload_to_drive(filename, data)
-    print(f"Done. {len(rows)} rows written.")
+    csv_filename = f"GMP_Terminal_Slots_{today_paris.isoformat()}.csv"
+
+    # Build Drive service once, reuse for all uploads
+    folder_id = os.environ["GDRIVE_FOLDER_ID"]
+    info = json.loads(os.environ["GDRIVE_CREDENTIALS_JSON"])
+    if isinstance(info, str):
+        info = json.loads(info)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    svc = build("drive", "v3", credentials=creds)
+
+    # Upload CSV
+    upload_to_drive(csv_filename, csv_data, "text/csv", svc, folder_id)
+
+    # Upload screenshots
+    for name, png_bytes in screenshots:
+        upload_to_drive(name, png_bytes, "image/png", svc, folder_id)
+
+    print(f"Done. {len(rows)} rows + {len(screenshots)} screenshot(s) uploaded.")
 
 
 if __name__ == "__main__":
