@@ -31,6 +31,7 @@ TERMINALS = [
         "slug": "tdf",
         "label": "Terminal de France (Le Havre)",
         "type": "tdf",
+        "file_prefix": "GMP",
         "urls": [
             "https://www.rdvgmp.fr/static/calendar_tdf.html",
             "https://www.rdvgmp.fr/static/calendar_tdf_next_week.html",
@@ -41,6 +42,7 @@ TERMINALS = [
         "slug": "gct_deltaport",
         "label": "GCT Deltaport (Vancouver)",
         "type": "gct",
+        "file_prefix": "GCT_Deltaport",
         "url": "https://webservices.globalterminals.com/tsiWebServiceClient/ReservationAvailabilityStatus.jsp?terminal=DELTAPORT",
         "min_rows": 5,
     },
@@ -48,6 +50,7 @@ TERMINALS = [
         "slug": "gct_vanterm",
         "label": "GCT Vanterm (Vancouver)",
         "type": "gct",
+        "file_prefix": "GCT_Vanterm",
         "url": "https://webservices.globalterminals.com/tsiWebServiceClient/ReservationAvailabilityStatus.jsp?terminal=VANTERM",
         "min_rows": 5,
     },
@@ -55,13 +58,17 @@ TERMINALS = [
         "slug": "truckgate_hamburg",
         "label": "Hamburg TruckGate",
         "type": "truckgate",
+        "file_prefix": "Hamburg_TruckGate",
         "url": "https://slot.truckgate.de/slots/",
         # Only extract these sub-terminals; empty list = all
         "terminals_filter": [
             "Eurogate CTH", "Eurogate EKOM", "EUROGATE CTB", "EUROGATE CTW",
             "HHLA CTA", "HHLA CTB", "HHLA CTT",
         ],
-        "min_rows": 10,
+        # No row-count floor: TruckGate legitimately has days with very few
+        # (or zero) open slots, so a minimum here would fail on real data,
+        # not just on broken parsing. Removed at user's request.
+        "min_rows": 0,
     },
 ]
 
@@ -182,9 +189,10 @@ def process_tdf(terminal: dict, browser, today_str: str):
         finally:
             page.close()
 
-        slug = "next_week" if "next_week" in url else "current_week"
+        week = "nextweek" if "next_week" in url else "currentweek"
+        prefix = terminal["file_prefix"]
         screenshots.append((
-            f"GMP_Terminal_Screenshot_{today_str}_{terminal['slug']}_{slug}.png",
+            f"{prefix}_terminal_screenshot_{today_str}_{week}.png",
             png_bytes,
         ))
 
@@ -234,8 +242,9 @@ def process_gct(terminal: dict, browser, today_str: str):
     finally:
         page.close()
 
+    prefix = terminal["file_prefix"]
     screenshots = [(
-        f"GMP_Terminal_Screenshot_{today_str}_{terminal['slug']}.png",
+        f"{prefix}_terminal_screenshot_{today_str}.png",
         png_bytes,
     )]
 
@@ -313,8 +322,9 @@ def process_truckgate(terminal: dict, browser, today_str: str):
     finally:
         page.close()
 
+    prefix = terminal["file_prefix"]
     screenshots = [(
-        f"GMP_Terminal_Screenshot_{today_str}_{terminal['slug']}.png",
+        f"{prefix}_terminal_screenshot_{today_str}.png",
         png_bytes,
     )]
 
@@ -364,8 +374,9 @@ def process_terminal(terminal: dict, browser, svc, folder_id: str, today_str: st
     writer.writerows(rows)
     csv_data = buf.getvalue().encode("utf-8")
 
+    prefix = terminal["file_prefix"]
     upload_file(
-        f"GMP_Terminal_Slots_{today_str}_{slug}.csv",
+        f"{prefix}_terminal_slots_{today_str}.csv",
         csv_data, "text/csv", svc, folder_id, verify=True,
     )
     for name, png_bytes in screenshots:
